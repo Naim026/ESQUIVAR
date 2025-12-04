@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Esquivar Obstáculos</title>
+  <style>
+    :root{--bg:#0f172a;--panel:#0b1220;--accent:#06b6d4}
+    html,body{height:100%;margin:0;font-family:Inter,Arial,sans-serif;background:linear-gradient(180deg,#0b1220,#071029);color:#e6eef8}
+    .wrap{max-width:900px;margin:28px auto;padding:18px;background:linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.01));border-radius:12px;box-shadow:0 10px 30px rgba(2,6,23,.6)}
+    h1{margin:0 0 10px;text-align:center}
+    .top{display:flex;gap:12px;align-items:center;justify-content:space-between}
+    .controls{display:flex;gap:8px;align-items:center}
+    button{background:var(--accent);color:#042029;border:0;padding:8px 12px;border-radius:8px;font-weight:600;cursor:pointer}
+    button.secondary{background:#6b7280;color:#fff}
+    .row{display:flex;gap:12px;align-items:center}
+    #stage{margin-top:12px;text-align:center;color:#9fb3c8}
+    .selection{display:flex;gap:12px;justify-content:center;margin:14px 0}
+    .char{width:80px;height:80px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:30px;cursor:pointer;border:3px solid transparent}
+    .char.selected{box-shadow:0 6px 20px rgba(6,182,212,.15);transform:translateY(-6px);border-color:rgba(6,182,212,.9)}
+    canvas{display:block;margin:12px auto;background:linear-gradient(180deg,#7dd3fc11,#0284c711);border-radius:8px}
+    .hud{display:flex;justify-content:space-between;align-items:center;color:#cfeefb;margin-top:8px}
+    .muted{color:#93b6c5;font-size:14px}
+    .center{display:flex;justify-content:center}
+    @media (max-width:600px){.char{width:60px;height:60px;font-size:24px}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Esquiva obstáculos</h1>
+    <div class="top">
+      <div class="row">
+        <div class="muted">Selecciona personaje:</div>
+        <div class="selection" id="selection"></div>
+      </div>
+      <div class="controls">
+        <button id="startBtn">Empezar</button>
+        <button id="resetBtn" class="secondary">Reiniciar</button>
+      </div>
+    </div>
+
+    <div id="stage">Pulsa <strong>Empezar</strong>, usa Espacio para saltar. <strong>Después de 30s: doble clic para eliminar un obstáculo (máx. 3 veces)</strong></div>
+
+    <canvas id="game" width="800" height="320"></canvas>
+
+    <div class="hud">
+      <div>Tiempo: <span id="time">0.0</span>s</div>
+      <div>Puntos: <span id="points">0</span></div>
+      <div>Dificultad: <span id="difficulty">0%</span></div>
+      <div id="powerStatus" style="color:#ff6b9d; font-weight:bold; display:none;">⚡ Poder: <span id="powerUses">0</span>/3</div>
+      <div class="muted">Mejor: <span id="best">0</span></div>
+    </div>
+  </div>
+
+  <script>
+    // Juego sencillo de esquivar obstáculos
+    // Selección de personaje -> iniciar -> esquivar con salto (espacio / clic)
+
+    const selectionEl = document.getElementById('selection');
+    const startBtn = document.getElementById('startBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const stage = document.getElementById('stage');
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const timeEl = document.getElementById('time');
+    const pointsEl = document.getElementById('points');
+    const bestEl = document.getElementById('best');
+
+    const CHARACTERS = [
+      {id: 'red', label: 'A', color: '#ef4444'},
+      {id: 'green', label: 'B', color: '#10b981'},
+      {id: 'blue', label: 'C', color: '#3b82f6'}
+    ];
+
+    let chosen = CHARACTERS[0];
+
+    // render selection
+    CHARACTERS.forEach(ch=>{
+      const d = document.createElement('div');
+      d.className = 'char'; d.style.background = ch.color; d.textContent = ch.label; d.title = ch.id;
+      d.addEventListener('click', ()=>{
+        chosen = ch; document.querySelectorAll('.char').forEach(n=>n.classList.remove('selected')); d.classList.add('selected');
+      });
+      selectionEl.appendChild(d);
+    });
+    // mark first
+    selectionEl.firstChild.classList.add('selected');
+
+    // Game state
+  let running = false;
+  let lastTime = 0;
+  let elapsed = 0; // ms
+  let score = 0;
+  let best = Number(localStorage.getItem('runner_best')||0);
+  bestEl.textContent = best;
+  let difficulty = 0; // 0.0 .. 1.0, increases with elapsed time
+  const DIFFICULTY_TIME_MS = 30000; // tiempo para llegar a dificultad máxima (30s)
+  const MIN_PIXEL_GAP = 240; // separación mínima en píxeles entre obstáculos al spawn
+  // Background / parallax offset and rotating themes
+  let bgOffset = 0;
+  const THEMES = ['sunny','rain','desert','bosque','night'];
+  const THEME_INTERVAL = 30000; // ms per theme
+  let currentThemeIndex = 0;
+  
+  // Double-click power: remove next obstacle
+  let lastJumpTime = 0;
+  let doubleClickWindow = 300; // ms to trigger double-click
+  let nextObstacleToRemove = false;
+  let powerUsesRemaining = 3; // max 3 uses per game
+  const POWER_UNLOCK_TIME = 30000; // 30 seconds before power can be used
+  let powerBlockedMessage = false; // show error message
+  let powerBlockedMessageTime = 0;
+  let powerShopOpen = false; // show power shop when powers run out
+  let powerUpgradesAvailable = 3; // max 3 additional powers can be bought (0, 1, 2, or 3)
+  // resume countdown after buying (ms)
+  let resumeCountdownActive = false;
+  let resumeCountdownMs = 0;
+
+    // Player
+    const player = {x:80,y:0,w:52,h:68,vy:0,jumping:false,ground:0,color:chosen.color};
+
+    // obstacles
+    let obstacles = [];
+    let spawnTimer = 0;
+
+    function resetGame(){
+      running = false; elapsed = 0; score = 0; obstacles = []; spawnTimer = 0; player.y = 0; player.vy = 0; player.jumping=false; player.color = chosen.color;
+      lastJumpTime = 0; nextObstacleToRemove = false; powerUsesRemaining = 3; powerBlockedMessage = false; powerShopOpen = false; powerUpgradesAvailable = 3;
+      timeEl.textContent = '0.0'; pointsEl.textContent = '0'; stage.textContent = 'Pulsa Empezar para jugar';
+      drawIntro();
+    }
+
+    function drawIntro(){
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      // forest background preview
+      drawForest(ctx);
+      // character preview
+      drawPlayer(ctx, player, chosen.color);
+      ctx.fillStyle = '#cfeefb'; ctx.font = '14px sans-serif'; ctx.fillText('Personaje: '+chosen.id, 12, 20);
+    }
+
+    // Draw a background depending on the current theme (rotates every THEME_INTERVAL)
+    function drawForest(ctx){
+      const theme = THEMES[currentThemeIndex] || 'sunny';
+
+      // helper for drawing sky text label
+      function drawThemeLabel(text){
+        ctx.fillStyle = 'rgba(255,255,255,0.9)'; ctx.font = '14px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText('Tema: ' + text, 12, 22);
+        ctx.textAlign = 'left';
+      }
+
+      if(theme === 'rain'){
+        // rainy sky
+        const skyGrad = ctx.createLinearGradient(0,0,0,canvas.height*0.8);
+        skyGrad.addColorStop(0,'#6b7a86'); skyGrad.addColorStop(1,'#91a7b6');
+        ctx.fillStyle = skyGrad; ctx.fillRect(0,0,canvas.width,canvas.height);
+        // clouds
+        drawCloud(ctx, canvas.width*0.2, 40, 60);
+        drawCloud(ctx, canvas.width*0.6, 60, 70);
+        // raindrops (animated with bgOffset)
+        ctx.strokeStyle = 'rgba(200,230,255,0.6)'; ctx.lineWidth = 1.2;
+        for(let i=0;i<80;i++){
+          const x = (i * 37 + (bgOffset*1.3|0)) % canvas.width;
+          const y = ((i*53) + (bgOffset*0.6|0)) % (canvas.height - 120);
+          ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x+3, y+12); ctx.stroke();
+        }
+        drawThemeLabel('Lluvia');
+      } else if(theme === 'desert'){
+        // desert sky and sand
+        const skyGrad = ctx.createLinearGradient(0,0,0,canvas.height*0.6);
+        skyGrad.addColorStop(0,'#ffd89b'); skyGrad.addColorStop(1,'#ffb347');
+        ctx.fillStyle = skyGrad; ctx.fillRect(0,0,canvas.width,canvas.height);
+        // sun harsh
+        ctx.fillStyle = '#fff4b8'; ctx.beginPath(); ctx.arc(canvas.width*0.85, 60, 40, 0, Math.PI*2); ctx.fill();
+        // sand
+        const sandGrad = ctx.createLinearGradient(0, canvas.height-120, 0, canvas.height);
+        sandGrad.addColorStop(0,'#f4d06f'); sandGrad.addColorStop(1,'#e1b86b');
+        ctx.fillStyle = sandGrad; ctx.fillRect(0, canvas.height-120, canvas.width, 120);
+        // simple cactus silhouettes
+        for(let i = -1; i < Math.ceil(canvas.width/200)+2; i++){
+          const x = (i*200) - (bgOffset*0.2 % 200) + 40;
+          ctx.fillStyle = '#3a6b2f'; roundRect(ctx, x, canvas.height-200, 18, 80, 6, true, false);
+          roundRect(ctx, x-12, canvas.height-170, 12, 12, 4, true, false);
+          roundRect(ctx, x+18, canvas.height-170, 12, 12, 4, true, false);
+        }
+        drawThemeLabel('Desierto');
+      } else if(theme === 'bosque'){
+        // dense forest (similar to previous sunny but moodier greens)
+        const skyGrad = ctx.createLinearGradient(0,0,0,canvas.height*0.7);
+        skyGrad.addColorStop(0,'#7ecb9f'); skyGrad.addColorStop(1,'#dff7e6');
+        ctx.fillStyle = skyGrad; ctx.fillRect(0,0,canvas.width,canvas.height);
+        // small sun
+        ctx.fillStyle = '#fff7c6'; ctx.beginPath(); ctx.arc(canvas.width*0.8, 60, 28, 0, Math.PI*2); ctx.fill();
+        // more and varied trees
+        const treeColors = ['#1f4f20','#2e6a2d','#3c7f36'];
+        const treeWidth = 110;
+        for(let i = -3; i < Math.ceil(canvas.width / treeWidth) + 3; i++){
+          const x = (i * treeWidth) - (bgOffset * 0.25 % treeWidth);
+          const h = 130 + (i%3)*10;
+          ctx.fillStyle = treeColors[Math.abs(i)%treeColors.length];
+          ctx.fillRect(x + treeWidth*0.45, canvas.height - 60 - h*0.32, treeWidth*0.12, h*0.32);
+          ctx.beginPath(); ctx.arc(x + treeWidth*0.5, canvas.height - 60 - h*0.85, treeWidth*0.4, 0, Math.PI*2); ctx.fill();
+        }
+        // bushes
+        for(let i = -1; i < Math.ceil(canvas.width / 180) + 2; i++){
+          const x = (i * 180) - (bgOffset * 0.5 % 180);
+          ctx.fillStyle = '#196b1b'; ctx.beginPath(); ctx.ellipse(x+40, canvas.height-75, 52, 36, 0, 0, Math.PI*2); ctx.fill();
+          ctx.fillStyle = '#2a8a2a'; ctx.beginPath(); ctx.ellipse(x+100, canvas.height-73, 44, 30, 0, 0, Math.PI*2); ctx.fill();
+        }
+        // grass strip
+        const grassGrad = ctx.createLinearGradient(0, canvas.height-60, 0, canvas.height);
+        grassGrad.addColorStop(0,'#6aa24a'); grassGrad.addColorStop(1,'#3e7a2b');
+        ctx.fillStyle = grassGrad; ctx.fillRect(0, canvas.height-60, canvas.width, 60);
+        drawThemeLabel('Bosque');
+      } else if(theme === 'night'){
+        // night sky with stars
+        const skyGrad = ctx.createLinearGradient(0,0,0,canvas.height*0.9);
+        skyGrad.addColorStop(0,'#021124'); skyGrad.addColorStop(1,'#05243a');
+        ctx.fillStyle = skyGrad; ctx.fillRect(0,0,canvas.width,canvas.height);
+        // stars (seeded by bgOffset for slight twinkle)
+        ctx.fillStyle = '#ffffff';
+        for(let i=0;i<120;i++){
+          const x = (i*37 + (bgOffset*0.7|0)) % canvas.width;
+          const y = ((i*59) + (bgOffset*0.3|0)) % (canvas.height*0.6);
+          ctx.fillRect(x, y, 1.5, 1.5);
+        }
+        // moon
+        ctx.fillStyle = '#f6f3d0'; ctx.beginPath(); ctx.arc(canvas.width*0.85, 70, 28, 0, Math.PI*2); ctx.fill();
+        drawThemeLabel('Noche');
+      } else {
+        // default sunny
+        const skyGrad = ctx.createLinearGradient(0,0,0,canvas.height*0.7);
+        skyGrad.addColorStop(0,'#87ceeb'); skyGrad.addColorStop(1,'#e0f6ff');
+        ctx.fillStyle = skyGrad; ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.fillStyle = '#ffd700'; ctx.beginPath(); ctx.arc(canvas.width*0.85, 50, 35, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = 'rgba(255,215,0,0.3)'; ctx.beginPath(); ctx.arc(canvas.width*0.85, 50, 50, 0, Math.PI*2); ctx.fill();
+        drawCloud(ctx, canvas.width*0.15, 30, 40);
+        drawCloud(ctx, canvas.width*0.55, 50, 35);
+
+        const treeColors = ['#2d5016','#3a6b1f','#4a8f2a'];
+        const treeWidth = 100;
+        for(let i = -2; i < Math.ceil(canvas.width / treeWidth) + 2; i++){
+          const x = (i * treeWidth) - (bgOffset * 0.25 % treeWidth);
+          const h = 100;
+          ctx.fillStyle = treeColors[i%treeColors.length];
+          ctx.fillRect(x + treeWidth*0.4, canvas.height - 60 - h*0.3, treeWidth*0.2, h*0.3);
+          ctx.beginPath(); ctx.arc(x + treeWidth*0.5, canvas.height - 60 - h*0.8, treeWidth*0.35, 0, Math.PI*2); ctx.fill();
+          ctx.beginPath(); ctx.arc(x + treeWidth*0.3, canvas.height - 60 - h*0.5, treeWidth*0.3, 0, Math.PI*2); ctx.fill();
+          ctx.beginPath(); ctx.arc(x + treeWidth*0.7, canvas.height - 60 - h*0.5, treeWidth*0.3, 0, Math.PI*2); ctx.fill();
+        }
+
+        for(let i = -1; i < Math.ceil(canvas.width / 180) + 2; i++){
+          const x = (i * 180) - (bgOffset * 0.5 % 180);
+          ctx.fillStyle = '#228b22'; ctx.beginPath(); ctx.ellipse(x+40, canvas.height-75, 48, 32, 0, 0, Math.PI*2); ctx.fill();
+          ctx.fillStyle = '#2d9e2d'; ctx.beginPath(); ctx.ellipse(x+90, canvas.height-73, 40, 28, 0, 0, Math.PI*2); ctx.fill();
+        }
+
+        const grassGrad = ctx.createLinearGradient(0, canvas.height-60, 0, canvas.height);
+        grassGrad.addColorStop(0,'#7cb342'); grassGrad.addColorStop(1,'#558b2f');
+        ctx.fillStyle = grassGrad; ctx.fillRect(0, canvas.height-60, canvas.width, 60);
+
+        ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1;
+        for(let y = canvas.height-60; y < canvas.height; y += 6){
+          ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+        }
+        drawThemeLabel('Soleado');
+      }
+    }
+
+    // Helper: draw a simple cloud
+    function drawCloud(ctx, x, y, size){
+      ctx.fillStyle = 'rgba(255,255,255,0.8)';
+      ctx.beginPath(); ctx.arc(x - size*0.5, y, size*0.5, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(x, y - size*0.3, size*0.6, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(x + size*0.5, y, size*0.5, 0, Math.PI*2); ctx.fill();
+    }
+
+    // Draw fun, more realistic obstacles
+    function drawObstacle(ctx, o){
+      // shadow on ground
+      ctx.fillStyle = 'rgba(0,0,0,0.2)'; ctx.beginPath(); ctx.ellipse(o.x + o.w/2, canvas.height-54, o.w*0.7, 5, 0,0,Math.PI*2); ctx.fill();
+      
+      if(o.type === 'mushroom'){
+        // big 3D mushroom cap with shading
+        ctx.fillStyle = '#d84040'; roundRect(ctx, o.x + o.w*0.15, o.y + o.h*0.1, o.w*0.7, o.h*0.55, 12, true, false);
+        // darker shade on one side (3D effect)
+        ctx.fillStyle = 'rgba(150,20,20,0.3)'; roundRect(ctx, o.x + o.w*0.15, o.y + o.h*0.3, o.w*0.7, o.h*0.25, 12, true, false);
+        // white spots (polka)
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath(); ctx.arc(o.x + o.w*0.35, o.y + o.h*0.25, 5, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(o.x + o.w*0.65, o.y + o.h*0.28, 6, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(o.x + o.w*0.5, o.y + o.h*0.42, 4.5, 0, Math.PI*2); ctx.fill();
+        // stem (thick tan)
+        ctx.fillStyle = '#d2b48c'; roundRect(ctx, o.x + o.w*0.35, o.y + o.h*0.6, o.w*0.3, o.h*0.4, 6, true, false);
+        // stem darker side
+        ctx.fillStyle = 'rgba(100,80,50,0.25)'; roundRect(ctx, o.x + o.w*0.45, o.y + o.h*0.65, o.w*0.15, o.h*0.35, 6, true, false);
+      } else if(o.type === 'log'){
+        // thick brown log
+        ctx.fillStyle = '#8b6f47'; roundRect(ctx, o.x, o.y + o.h*0.25, o.w, o.h*0.5, 10, true, false);
+        // darker shading
+        ctx.fillStyle = 'rgba(60,45,30,0.4)'; roundRect(ctx, o.x, o.y + o.h*0.5, o.w, o.h*0.25, 10, true, false);
+        // wood knots
+        ctx.fillStyle = '#5d4e2a';
+        ctx.beginPath(); ctx.arc(o.x + o.w*0.2, o.y + o.h*0.5, 5, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(o.x + o.w*0.7, o.y + o.h*0.4, 6, 0, Math.PI*2); ctx.fill();
+      } else if(o.type === 'bush'){
+        // bushy, frondose shrub
+        ctx.fillStyle = '#2d7d2d'; ctx.beginPath(); ctx.ellipse(o.x + o.w*0.25, o.y + o.h*0.5, o.w*0.4, o.h*0.55, 0,0,Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(o.x + o.w*0.65, o.y + o.h*0.45, o.w*0.42, o.h*0.58, 0,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#1f5b1f'; ctx.beginPath(); ctx.ellipse(o.x + o.w*0.5, o.y + o.h*0.3, o.w*0.35, o.h*0.4, 0,0,Math.PI*2); ctx.fill();
+        // lighter highlights
+        ctx.fillStyle = 'rgba(100,180,80,0.5)'; ctx.beginPath(); ctx.ellipse(o.x + o.w*0.3, o.y + o.h*0.35, o.w*0.15, o.h*0.15, 0,0,Math.PI*2); ctx.fill();
+      } else if(o.type === 'rock'){
+        // gray rock
+        ctx.fillStyle = '#8b8b8b'; roundRect(ctx, o.x + o.w*0.1, o.y, o.w*0.8, o.h*0.7, 8, true, false);
+        // darker side (3D)
+        ctx.fillStyle = 'rgba(60,60,60,0.4)'; roundRect(ctx, o.x + o.w*0.1, o.y + o.h*0.4, o.w*0.8, o.h*0.3, 8, true, false);
+        // lighter highlights
+        ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.beginPath(); ctx.ellipse(o.x + o.w*0.35, o.y + o.h*0.25, o.w*0.15, o.h*0.12, 0,0,Math.PI*2); ctx.fill();
+      } else if(o.type === 'bird'){
+        // flying bird (simple)
+        ctx.fillStyle = '#8b4513'; 
+        // body
+        ctx.beginPath(); ctx.ellipse(o.x + o.w*0.5, o.y + o.h*0.5, o.w*0.2, o.h*0.25, 0,0,Math.PI*2); ctx.fill();
+        // head
+        ctx.beginPath(); ctx.arc(o.x + o.w*0.6, o.y + o.h*0.35, o.w*0.12, 0, Math.PI*2); ctx.fill();
+        // eye
+        ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(o.x + o.w*0.65, o.y + o.h*0.32, 2, 0, Math.PI*2); ctx.fill();
+        // wings (angle changes based on position for animation illusion)
+        const wingTilt = Math.sin((o.x + o.y) * 0.01) * 0.3;
+        ctx.fillStyle = '#654321'; ctx.beginPath(); ctx.ellipse(o.x + o.w*0.4, o.y + o.h*0.5, o.w*0.22, o.h*0.08, wingTilt, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(o.x + o.w*0.6, o.y + o.h*0.5, o.w*0.22, o.h*0.08, -wingTilt, 0, Math.PI*2); ctx.fill();
+      } else if(o.type === 'butterfly'){
+        // colorful butterfly
+        ctx.fillStyle = '#ff6b9d';
+        // left wing
+        ctx.beginPath(); ctx.ellipse(o.x + o.w*0.3, o.y + o.h*0.4, o.w*0.18, o.h*0.3, 0, 0, Math.PI*2); ctx.fill();
+        // right wing
+        ctx.beginPath(); ctx.ellipse(o.x + o.w*0.7, o.y + o.h*0.4, o.w*0.18, o.h*0.3, 0, 0, Math.PI*2); ctx.fill();
+        // body
+        ctx.fillStyle = '#333'; ctx.beginPath(); ctx.ellipse(o.x + o.w*0.5, o.y + o.h*0.45, o.w*0.08, o.h*0.35, 0, 0, Math.PI*2); ctx.fill();
+        // antenna
+        ctx.strokeStyle = '#333'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(o.x + o.w*0.5, o.y + o.h*0.2); ctx.lineTo(o.x + o.w*0.42, o.y); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(o.x + o.w*0.5, o.y + o.h*0.2); ctx.lineTo(o.x + o.w*0.58, o.y); ctx.stroke();
+        // wing patterns
+        ctx.fillStyle = '#ffb3d9';
+        ctx.beginPath(); ctx.arc(o.x + o.w*0.3, o.y + o.h*0.35, 5, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(o.x + o.w*0.7, o.y + o.h*0.35, 5, 0, Math.PI*2); ctx.fill();
+      } else {
+        // fallback
+        ctx.fillStyle = '#d97706'; ctx.fillRect(o.x, o.y, o.w, o.h);
+      }
+    }
+
+    function spawnObstacle(){
+      // choose realistic obstacle type
+      const types = ['mushroom','log','bush','rock','bird','butterfly'];
+      const type = types[Math.floor(Math.random()*types.length)];
+
+      // sizing by type (more realistic)
+      let w = 32 + Math.random()*24;
+      let height = 40 + Math.random()*48;
+      if(type === 'mushroom'){ w = 36 + Math.random()*20; height = 48 + Math.random()*32; }
+      if(type === 'log'){ w = 50 + Math.random()*30; height = 24; }
+      if(type === 'bush'){ w = 42 + Math.random()*28; height = 50 + Math.random()*36; }
+      if(type === 'rock'){ w = 34 + Math.random()*22; height = 30 + Math.random()*20; }
+      if(type === 'bird'){ w = 28 + Math.random()*16; height = 24; }
+      if(type === 'butterfly'){ w = 24 + Math.random()*14; height = 32; }
+
+      // Base speed increases with difficulty
+      const baseSpeed = 160 + difficulty * 420; // from ~160 to ~580
+      const speed = baseSpeed + Math.random()*80;
+      obstacles.push({x:canvas.width + 10, y: canvas.height-60 - height, w: w, h: height, speed: speed, type});
+    }
+
+    function update(dt){
+      // If the game is not running, nothing to update (except countdown logic when running=true)
+      if(!running) return;
+
+      // If resume countdown is active (after buying), decrement it but DO NOT advance game state
+      if(resumeCountdownActive){
+        resumeCountdownMs -= dt;
+        if(resumeCountdownMs <= 0){
+          resumeCountdownActive = false; // countdown finished - gameplay will resume next frames
+        } else {
+          // still counting down; keep game frozen (do not advance elapsed or move obstacles)
+          return;
+        }
+      }
+
+      elapsed += dt; timeEl.textContent = (elapsed/1000).toFixed(1);
+      
+      // Update power error message timer
+      if(powerBlockedMessage){
+        powerBlockedMessageTime += dt;
+        if(powerBlockedMessageTime > 2000){ // show for 2 seconds
+          powerBlockedMessage = false;
+        }
+      }
+      
+      // Update power status display
+      const powerStatusEl = document.getElementById('powerStatus');
+      const powerUsesEl = document.getElementById('powerUses');
+      
+      // Show power status if unlocked and has uses remaining
+      if(elapsed >= POWER_UNLOCK_TIME){
+        powerStatusEl.style.display = 'block';
+        powerUsesEl.textContent = (3 - powerUsesRemaining);
+        if(nextObstacleToRemove){
+          powerStatusEl.style.color = '#4ade80'; // green when active
+        } else {
+          powerStatusEl.style.color = '#ff6b9d'; // pink when available
+        }
+      } else {
+        powerStatusEl.style.display = 'block';
+        powerStatusEl.style.color = '#888'; // gray when locked
+        powerUsesEl.textContent = '(Bloqueado ' + (30 - Math.floor(elapsed/1000)) + 's)';
+      }
+      
+  // background scroll -- a bit slower than obstacles for parallax
+  const bgSpeed = 80 + difficulty * 160; // px/s
+  bgOffset = (bgOffset + bgSpeed * (dt/1000)) % (canvas.width);
+  // update theme based on elapsed time (rotate every THEME_INTERVAL)
+  currentThemeIndex = Math.floor(elapsed / THEME_INTERVAL) % THEMES.length;
+      // gravity
+      const g = 1200; // px/s^2
+      player.vy += g * (dt/1000);
+      player.y += player.vy * (dt/1000);
+      // ground
+      const groundY = canvas.height - 60 - player.h;
+      if(player.y > groundY){ player.y = groundY; player.vy = 0; player.jumping=false; }
+
+      // update difficulty (based on elapsed ms)
+      difficulty = Math.min(1, elapsed / DIFFICULTY_TIME_MS);
+      // update difficulty display
+      const difficultyEl = document.getElementById('difficulty');
+      if(difficultyEl) difficultyEl.textContent = Math.round(difficulty * 100) + '%';
+
+      // obstacles: spawn interval decreases as difficulty increases
+      // BUT after 30 seconds, increase minimum gap to give time for power usage
+      spawnTimer += dt/1000;
+      let minInterval = 1.0; // seconds at max difficulty
+      let maxInterval = 2.4; // seconds at min difficulty
+      let minGap = MIN_PIXEL_GAP; // minimum pixel gap
+      
+      if(elapsed >= POWER_UNLOCK_TIME){
+        // After 30s: increase gaps to allow power usage opportunities
+        minInterval = 1.5; // longer minimum
+        maxInterval = 3.2; // longer maximum
+        minGap = MIN_PIXEL_GAP + 80; // more space between obstacles
+      }
+      
+      const spawnInterval = maxInterval - (maxInterval - minInterval) * difficulty; // lerp
+      if(spawnTimer > spawnInterval){
+        // try to spawn one obstacle but ensure minimum pixel gap to previous obstacle
+        // small random chance to skip spawn at very low difficulty
+        const skipChance = 0.08 * (1 - difficulty); // more likely to skip when difficulty low
+
+        const rightmost = obstacles.length ? obstacles.reduce((acc, o) => (o.x > acc.x ? o : acc), obstacles[0]) : null;
+        const gapPixels = rightmost ? (canvas.width + 10) - (rightmost.x + rightmost.w) : Infinity;
+
+        if(Math.random() > skipChance && gapPixels >= minGap){
+          spawnTimer = 0; // only reset timer when we actually spawn
+          spawnObstacle();
+        } else {
+          // do not reset spawnTimer so we will try again shortly
+        }
+      }
+      obstacles.forEach(o=>{ o.x -= o.speed * (dt/1000); });
+      obstacles = obstacles.filter(o=>o.x + o.w > -20);
+
+      // collision
+      for(const o of obstacles){
+        if(rectIntersect(player.x, player.y, player.w, player.h, o.x, o.y, o.w, o.h)){
+          if(nextObstacleToRemove){
+            // Remove this obstacle using the power
+            nextObstacleToRemove = false;
+            obstacles = obstacles.filter(ob => ob !== o);
+            continue;
+          }
+          endRun(); return;
+        }
+        // score when obstacle passes player
+        if(!o.scored && o.x + o.w < player.x){ o.scored = true; score += 1; pointsEl.textContent = score; }
+      }
+    }
+
+    function rectIntersect(x1,y1,w1,h1,x2,y2,w2,h2){
+      return !(x2 > x1 + w1 || x2 + w2 < x1 || y2 > y1 + h1 || y2 + h2 < y1);
+    }
+
+    function draw(){
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      // forest background (parallax)
+      drawForest(ctx);
+      // player
+      drawPlayer(ctx, player, chosen.color);
+      // obstacles (draw fun shapes)
+      obstacles.forEach(o=>{ drawObstacle(ctx, o); });
+      // UI overlay
+      ctx.fillStyle = '#cfeefb'; ctx.font = '14px sans-serif'; ctx.fillText('Puntos: '+score, canvas.width-110, 22);
+      
+      // Show power blocked message if triggered
+      if(powerBlockedMessage){
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(canvas.width*0.15, canvas.height*0.35, canvas.width*0.7, 50);
+        ctx.fillStyle = '#ff3333';
+        ctx.font = 'bold 18px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('El poder aun no esta disponible', canvas.width*0.5, canvas.height*0.62);
+        ctx.textAlign = 'left';
+      }
+      
+      // Show power shop if powers ran out
+      if(powerShopOpen){
+        drawPowerShop(ctx);
+      }
+
+      // If resume countdown active (after buying), draw overlay with big numbers
+      if(resumeCountdownActive){
+        const secs = Math.ceil(resumeCountdownMs / 1000);
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 84px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(secs.toString(), canvas.width/2, canvas.height/2 + 28);
+        ctx.font = '16px sans-serif';
+        ctx.fillText('Reanudando en...', canvas.width/2, canvas.height/2 - 40);
+        ctx.textAlign = 'left';
+      }
+    }
+    
+    // Draw power shop interface
+    function drawPowerShop(ctx){
+      // dark overlay
+      ctx.fillStyle = 'rgba(0,0,0,0.8)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      
+      // shop panel
+      const panelX = canvas.width * 0.1;
+      const panelY = canvas.height * 0.15;
+      const panelW = canvas.width * 0.8;
+      const panelH = canvas.height * 0.7;
+      
+      ctx.fillStyle = '#1a3a2a';
+      ctx.fillRect(panelX, panelY, panelW, panelH);
+      ctx.strokeStyle = '#4ade80';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(panelX, panelY, panelW, panelH);
+      
+      // title
+      ctx.fillStyle = '#4ade80';
+      ctx.font = 'bold 28px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('¡Se te han acabado los poderes!', canvas.width * 0.5, panelY + 45);
+      
+      // description
+      ctx.fillStyle = '#cfeefb';
+      ctx.font = '16px sans-serif';
+      ctx.fillText('¿Quieres comprar más usos del poder?', canvas.width * 0.5, panelY + 80);
+      ctx.fillText('Cada poder cuesta 25 puntos', canvas.width * 0.5, panelY + 110);
+      
+      // current score
+      ctx.fillStyle = '#ff6b9d';
+      ctx.font = 'bold 18px sans-serif';
+      ctx.fillText('Puntos actuales: ' + score, canvas.width * 0.5, panelY + 150);
+      
+      // buttons
+      const btnW = 140;
+      const btnH = 50;
+      const btnY = panelY + panelH - 100;
+      
+      // Buy button
+      const buyX = canvas.width * 0.5 - btnW - 20;
+      ctx.fillStyle = score >= 25 && powerUpgradesAvailable > 0 ? '#4ade80' : '#888';
+      ctx.fillRect(buyX, btnY, btnW, btnH);
+      ctx.fillStyle = '#000';
+      ctx.font = 'bold 16px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Comprar (+3)', buyX + btnW/2, btnY + 35);
+      
+      // Skip button
+      const skipX = canvas.width * 0.5 + 20;
+      ctx.fillStyle = '#666';
+      ctx.fillRect(skipX, btnY, btnW, btnH);
+      ctx.fillStyle = '#cfeefb';
+      ctx.fillText('Continuar', skipX + btnW/2, btnY + 35);
+      
+      // Store buy/skip button state for click detection
+      ctx.buyButtonRect = {x: buyX, y: btnY, w: btnW, h: btnH};
+      ctx.skipButtonRect = {x: skipX, y: btnY, w: btnW, h: btnH};
+      
+      ctx.textAlign = 'left';
+    }
+
+    // small utility: rounded rect
+    function roundRect(ctx, x, y, w, h, r, fill, stroke){
+      if(typeof r === 'undefined') r = 5;
+      if(typeof r === 'number'){ r = {tl: r, tr: r, br: r, bl: r}; }
+      ctx.beginPath(); ctx.moveTo(x + r.tl, y);
+      ctx.lineTo(x + w - r.tr, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r.tr);
+      ctx.lineTo(x + w, y + h - r.br); ctx.quadraticCurveTo(x + w, y + h, x + w - r.br, y + h);
+      ctx.lineTo(x + r.bl, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r.bl);
+      ctx.lineTo(x, y + r.tl); ctx.quadraticCurveTo(x, y, x + r.tl, y);
+      ctx.closePath(); if(fill) ctx.fill(); if(stroke) ctx.stroke();
+    }
+
+    // Draw player as a simple person figure
+    function drawPlayer(ctx, p, color){
+      const cx = p.x + p.w / 2;
+      const cy = p.y;
+      const scale = p.h / 48; // normalize to base height
+      
+      // head
+      ctx.fillStyle = '#f4a460'; // skin tone
+      ctx.beginPath(); ctx.arc(cx, cy + 6*scale, 6*scale, 0, Math.PI*2); ctx.fill();
+      
+      // body
+      ctx.fillStyle = color;
+      roundRect(ctx, cx - 4*scale, cy + 12*scale, 8*scale, 14*scale, 3*scale, true, false);
+      
+      // left arm
+      ctx.fillStyle = '#f4a460';
+      roundRect(ctx, cx - 10*scale, cy + 14*scale, 6*scale, 12*scale, 3*scale, true, false);
+      
+      // right arm
+      roundRect(ctx, cx + 4*scale, cy + 14*scale, 6*scale, 12*scale, 3*scale, true, false);
+      
+      // left leg
+      ctx.fillStyle = '#333';
+      roundRect(ctx, cx - 4*scale, cy + 26*scale, 3.5*scale, 14*scale, 2*scale, true, false);
+      
+      // right leg
+      roundRect(ctx, cx + 0.5*scale, cy + 26*scale, 3.5*scale, 14*scale, 2*scale, true, false);
+      
+      // face (eyes)
+      ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.arc(cx - 2.5*scale, cy + 4*scale, 1.5*scale, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + 2.5*scale, cy + 4*scale, 1.5*scale, 0, Math.PI*2); ctx.fill();
+      
+      // mouth (simple smile)
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 0.8*scale;
+      ctx.beginPath(); ctx.arc(cx, cy + 7*scale, 2*scale, 0, Math.PI); ctx.stroke();
+    }
+
+    // Handle power shop clicks
+    canvas.addEventListener('click', (e) => {
+      if(!powerShopOpen) return;
+      
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      
+      // Check buy button
+      if(ctx.buyButtonRect && x >= ctx.buyButtonRect.x && x <= ctx.buyButtonRect.x + ctx.buyButtonRect.w &&
+         y >= ctx.buyButtonRect.y && y <= ctx.buyButtonRect.y + ctx.buyButtonRect.h){
+        // Buy button clicked
+        if(score >= 25 && powerUpgradesAvailable > 0){
+          score -= 25;
+          pointsEl.textContent = score;
+          powerUsesRemaining = 3;
+          powerUpgradesAvailable--;
+          powerShopOpen = false;
+          // start a 3-second countdown before resuming, keep game state frozen
+          resumeCountdownActive = true;
+          resumeCountdownMs = 3000;
+          running = true; // start loop so we can render countdown
+          requestAnimationFrame(loop);
+        }
+        return;
+      }
+      
+      // Check skip button
+      if(ctx.skipButtonRect && x >= ctx.skipButtonRect.x && x <= ctx.skipButtonRect.x + ctx.skipButtonRect.w &&
+         y >= ctx.skipButtonRect.y && y <= ctx.skipButtonRect.y + ctx.skipButtonRect.h){
+        // Skip button clicked
+        powerShopOpen = false;
+        running = true;
+        requestAnimationFrame(loop);
+        return;
+      }
+    });
+
+    function loop(ts){
+      if(!lastTime) lastTime = ts; const dt = ts - lastTime; lastTime = ts;
+      update(dt); draw();
+      if(running) requestAnimationFrame(loop);
+    }
+
+    function startRun(){
+      if(running) return; running = true; lastTime = 0; elapsed = 0; score = 0; obstacles = []; spawnTimer = 0; stage.textContent = 'Corriendo... ¡Salta o usa tu poder (doble clic)!'; pointsEl.textContent = '0';
+      player.color = chosen.color; requestAnimationFrame(loop);
+    }
+
+    function endRun(){
+      running = false; stage.textContent = 'Game Over. Pulsa Reiniciar o Empezar.'; if(score > best){ best = score; localStorage.setItem('runner_best', best); bestEl.textContent = best; }
+    }
+
+    // controls
+    window.addEventListener('keydown', (e)=>{ if(e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); if(!running) startRun(); jump(); } });
+    canvas.addEventListener('touchstart', (e)=>{ e.preventDefault(); if(!running) startRun(); jump(); });
+    canvas.addEventListener('mousedown', ()=>{ if(!running) startRun(); jump(); });
+
+    function jump(){ 
+      const now = Date.now();
+      // Check for double-click
+      if(now - lastJumpTime < doubleClickWindow){
+        // Double-click detected! Check if power can be used
+        if(elapsed < POWER_UNLOCK_TIME){
+          // Power not available yet - show error message
+          powerBlockedMessage = true;
+          powerBlockedMessageTime = 0;
+        } else if(powerUsesRemaining > 0){
+          // Double-click is valid! Mark next obstacle for removal
+          nextObstacleToRemove = true;
+          powerUsesRemaining--;
+          // Check if powers ran out
+          if(powerUsesRemaining === 0 && powerUpgradesAvailable > 0){
+            running = false;
+            powerShopOpen = true;
+          }
+        }
+      }
+      lastJumpTime = now;
+      
+      if(player.jumping) return; 
+      player.vy = -520; 
+      player.jumping = true; 
+    }
+
+    startBtn.addEventListener('click', ()=>{ startRun(); });
+    resetBtn.addEventListener('click', ()=>{ resetGame(); });
+
+    // resize canvas for responsiveness
+    function fitCanvas(){ const scale = Math.min(900, Math.max(320, window.innerWidth - 80)); canvas.width = Math.round(scale); canvas.height = Math.round(Math.max(280, window.innerHeight * 0.45)); }
+    window.addEventListener('resize', ()=>{ fitCanvas(); resetGame(); });
+
+    // initial
+    fitCanvas(); resetGame();
+  </script>
+</body>
+</html>
