@@ -1,1 +1,2 @@
 El juego consiste en evitar obstaculos saltando, en diferentes lugares como desiertos, bosques, bajo la lluvia....tambien tienes un poder que puedes utilizar 3 veces durante la partida, eso si, no los puedes utiizar los primeros 30 segundos ya que seria demasiado facil. A medida que vas jugando, vas sumando puntos, y esos puntos los puedes utilizar por ejemplo para comprar mas poderes si te quedas sin ellos.
+https://naim026.github.io/ESQUIVAR/index.html
